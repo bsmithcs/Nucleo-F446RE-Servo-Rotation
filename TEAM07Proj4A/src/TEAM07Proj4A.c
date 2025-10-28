@@ -6,6 +6,7 @@
  ****************************************************************/
 
 #include "stm32f4xx.h"
+#include "SSD_Array.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -34,21 +35,31 @@
 
 /***** Variables *****/
 
-volatile bool going_cw;
-volatile bool stopped;
+volatile bool going_cw = true;
+volatile bool stopped = false;
 
 volatile uint32_t signal_pulse_width;
 volatile uint32_t wiper_val;
 volatile float rpm;
 volatile int digit_select = 0;
 
+volatile bool waiting_for_falling = false;
+volatile uint32_t last_rising;
+volatile uint32_t last_falling;
+volatile uint32_t pulse_width;
+
+volatile uint32_t dcycle;
+volatile uint32_t max_dcycle = 97;
+volatile uint32_t min_dcycle = 3;
+volatile uint32_t current_angle;
+volatile uint32_t previous_angle;
+
+
 /***** Helper Functions *****/
 
 /// @brief This function configures TIM2 with 500 us interrupts 
 /// using 1MHz prescaler. Used to flicker SSD selection.
 void TIM2_Config(void) {
-    // Configure TIM2 for XX microseconds interrupt (assuming 16MHz HSI clock)
-    RCC->APB1ENR |= RCC_APB1ENR_TIM2EN; // Enable TIM2 clock
     TIM2->PSC = 15; // Prescaler: (16MHz/(15+1) = 1MHz, 1usec period)
     TIM2->ARR = 500 - 1; // Auto-reload when CNT = XX: (period = XX usec)
     TIM2->DIER |= TIM_DIER_UIE; // Enable update interrupt
@@ -58,33 +69,65 @@ void TIM2_Config(void) {
     TIM2->CR1 = TIM_CR1_CEN; // Enable TIM2
 }
 
-/// @brief Configures pulse width modulation via TIM3 for the servo on PC6
 void PWM_Output_PC6_Init(void) {
-	// Set PC6 to alternate function (AF2 for TIM3_CH1)
+	// Set PC6 to alternate function (AF3 for TIM8_CH1)
 	GPIOC->MODER &= ~(0x3 << (SERVO3_PIN * 2));
 	GPIOC->MODER |=  (0x2 << (SERVO3_PIN * 2)); // Alternate function
 	GPIOC->AFR[0] &= ~(0xF << (SERVO3_PIN * 4));
-	GPIOC->AFR[0] |=  (0x2 << (SERVO3_PIN * 4)); // AF2 = TIM3
-	// Configure TIM3 for PWM output on CH1 (PC6)
-	TIM3->PSC = (FREQUENCY/1000000) - 1; // 16 MHz / 16 = 1 MHz timer clock (1us resolution)
-	TIM3->ARR = 19999; // Period for 50 Hz
-	TIM3->CCR1 = 1500; // Duty cycle (1.475 ms pulse width)
-	TIM3->CCMR1 &= ~(TIM_CCMR1_OC1M);
-	TIM3->CCMR1 |= (6 << TIM_CCMR1_OC1M_Pos); // PWM mode 1
-	TIM3->CCMR1 |= TIM_CCMR1_OC1PE; // Preload enable
-	TIM3->CCER |= TIM_CCER_CC1E; // Enable CH1 output (PC6)
-	TIM3->CR1 |= TIM_CR1_ARPE; // Auto-reload preload enable
-	TIM3->EGR = TIM_EGR_UG; // Generate update event
-	TIM3->CR1 |= TIM_CR1_CEN; // Enable timer
+	GPIOC->AFR[0] |=  (0x3 << (SERVO3_PIN * 4)); // AF3 = TIM8
+
+    // Configure output type and speed for PC6: push-pull, high speed
+    GPIOC->OTYPER &= ~(1 << SERVO3_PIN); // push-pull
+    GPIOC->OSPEEDR &= ~(0x3 << (SERVO3_PIN * 2));
+    GPIOC->OSPEEDR |=  (0x2 << (SERVO3_PIN * 2)); // high speed
+
+	// Configure TIM8 for PWM output on CH1 (PC6)
+	TIM8->PSC = 15; // 16 MHz / 16 = 1 MHz timer clock (1us resolution)
+	TIM8->ARR = 19999; // Period for 50 Hz
+	TIM8->CCR1 = 1500; // Duty cycle (1.475 ms pulse width)
+	TIM8->CCMR1 &= ~(TIM_CCMR1_OC1M);
+	TIM8->CCMR1 |= (6 << TIM_CCMR1_OC1M_Pos); // PWM mode 1
+	TIM8->CCMR1 |= TIM_CCMR1_OC1PE; // Preload enable
+	TIM8->CCER |= TIM_CCER_CC1E; // Enable CH1 output (PC6)
+
+	// For advanced-control timers (TIM8) the main output must be enabled
+	// using the BDTR MOE bit or outputs will stay inactive even if CC1E is set.
+	TIM8->BDTR |= TIM_BDTR_MOE;
+	TIM8->CR1 |= TIM_CR1_ARPE; // Auto-reload preload enable
+	TIM8->EGR = TIM_EGR_UG; // Generate update event
+	TIM8->CR1 |= TIM_CR1_CEN; // Enable timer
+}
+
+void PWM_Input_PC7_Init(void) {
+	// Set PC7 to alternate function (AF2 for TIM3_CH2)
+	GPIOC->MODER &= ~(0x3 << (7 * 2));
+	GPIOC->MODER |=  (0x2 << (7 * 2)); // Alternate function
+	GPIOC->AFR[0] &= ~(0xF << (7 * 4));
+	GPIOC->AFR[0] |=  (0x2 << (7 * 4)); // AF2 = TIM3
+
+	// Configure TIM3 for simple input capture on CH2 (PC7)
+	TIM3->PSC = 15; // 16 MHz / 16 = 1 MHz timer clock (1us resolution)
+	TIM3->ARR = 0xFFFF;
+	TIM3->CCMR1 &= ~(0x3 << 8); // CC2S bits for CH2
+	TIM3->CCMR1 |= (0x01 << 8); // CC2: IC2 mapped to TI2
+	TIM3->CCER &= ~(TIM_CCER_CC2P | TIM_CCER_CC2NP); // Rising edge
+	TIM3->CCER |= TIM_CCER_CC2E; // Enable capture on CH2
+	TIM3->DIER |= TIM_DIER_CC2IE; // Enable capture/compare 2 interrupt
+	TIM3->CR1 |= TIM_CR1_CEN;
+	NVIC_EnableIRQ(TIM3_IRQn); // Enable TIM3 interrupt in NVIC
 }
 
 /// @brief sends pulse to servo with pulsewidth corresponding to the desired angle
 /// @param angle angle to send the standard servo to  
 void servo_angle_set(int speed) {
-    // Assuming speeds from 0 to 140 rpm
-    if (going_cw) signal_pulse_width = speed * (200 / 140) + 1520;
-    else signal_pulse_width = speed * (200 / 140) + 1280;
-	TIM3->CCR1 = signal_pulse_width;
+    // Assuming speeds from 0 to 4095 (12-bit ADC range)
+    // Compute delta in the range 0..200 using integer math without losing precision
+    uint32_t delta = ( (uint32_t)speed * 200u ) / 4095u;
+    if (stopped) signal_pulse_width = 1500u;
+    else if (going_cw) signal_pulse_width = 1480u - delta;
+    else signal_pulse_width = delta + 1520u;
+    // Write to TIM8 CH1 CCR (PC6 PWM output)
+    TIM8->CCR1 = signal_pulse_width;
 }
 
 /// @brief Sends character to USART to be displayed on serial monitor 
@@ -129,7 +172,7 @@ void uart_Config(void) {
     USART2->BRR = 16000000UL / BAUDRATE; // Assuming 16 MHz clock
     USART2->CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_UE; // Enable TX, RX, USART
 
-    uart_sendString("\r\nCPEG222: TEAM07Proj3A\r\nUltrasound-based Radar\r\n\r\n");
+    uart_sendString("\r\nCPEG222: TEAM07Proj4A\r\nCont. Servo\r\n\r\n");
 }
 
 /// @brief Displays relevant info on the serial monitor given the current angle
@@ -138,9 +181,9 @@ void uart_display() {
     uart_send_int32(wiper_val);
 
     uart_sendString("\t\tDirection: ");
-    if (stopped) uart_send_str("STOP");
-    else if (going_cw) uart_send_str("CW");
-    else uart_send_str("CCW");
+    if (stopped) uart_sendString("STOP");
+    else if (going_cw) uart_sendString("CW");
+    else uart_sendString("CCW");
 
     uart_sendString("\t\tservo (us): ");
     uart_send_int32(signal_pulse_width);
@@ -177,9 +220,15 @@ void Pot_Config(void) {
     // Initialize ADC, Default resolution is 12 bits
     ADC1->SQR3 = ADC_CHANNEL; // Select channel
     ADC1->SMPR2 = ADC_SMPR2_SMP1_0 | ADC_SMPR2_SMP1_1; // Sample time 56 cycles
+    ADC1->CR1 |= ADC_CR1_EOCIE; // Enable End of Conversion interrupt
     ADC1->CR2 = ADC_CR2_ADON; // Enable ADC
-
+    
+    // Configure NVIC for ADC interrupt
+    NVIC_EnableIRQ(ADC_IRQn);
+    NVIC_SetPriority(ADC_IRQn, 2);
 }
+
+
 
 /***** Interrupts *****/
 
@@ -205,32 +254,87 @@ void TIM2_IRQHandler(void){
     if (TIM2->SR & TIM_SR_UIF) {
         TIM2->SR &= ~TIM_SR_UIF; // clear update interrupt flag
         digit_select = (digit_select + 1) % 4;
+        
         SSD_update(digit_select, (int)(rpm * 10), 3);
+        previous_angle = current_angle;
     }
 }
 
-/// @brief Handles sending trigger pulse every 0.5 seconds
+// TIM3 input capture interrupt handler for PC7 (CH2)
+void TIM3_IRQHandler(void) {
+	if (TIM3->SR & TIM_SR_CC2IF) { // Check if CC2IF is set
+		TIM3->SR &= ~TIM_SR_CC2IF; // Clear interrupt flag
+		if (!waiting_for_falling) {
+			last_rising = TIM3->CCR2;
+			// Switch to capture falling edge
+			TIM3->CCER |= TIM_CCER_CC2P; // Set to falling edge
+			waiting_for_falling = 1;
+		} else {
+			last_falling = TIM3->CCR2;
+			if (last_falling >= last_rising){
+				if (last_falling - last_rising < 1100) 
+				pulse_width = last_falling - last_rising;
+                dcycle = 100 * (pulse_width / 1100);
+				rpm = (dcycle - min_dcycle)*360/(max_dcycle - min_dcycle);
+			} else
+				pulse_width = (0xFFFF - last_rising) + last_falling + 1;
+			// Switch back to capture rising edge
+			TIM3->CCER &= ~TIM_CCER_CC2P; // Set to rising edge
+			waiting_for_falling = 0;
+		}
+	}
+}
+
+/// @brief Display to uart every 1 second
 void SysTick_Handler(void) {
     uart_display();
 }
+
+/// @brief Handles ADC conversion complete interrupt
+void ADC_IRQHandler(void) {
+    if (ADC1->SR & ADC_SR_EOC) {  // Check if End of Conversion
+        wiper_val = ADC1->DR;      // Read the converted value
+
+        servo_angle_set(wiper_val);
+        // Start next conversion
+        ADC1->CR2 |= ADC_CR2_SWSTART;
+    }
+}
  
 /***** Main *****/
-void main(void) {
+int main(void) {
 
-    /***** Enable necessary ports *****/
-    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN
-                 |  RCC_AHB1ENR_GPIOCEN;
-    RCC->APB2ENR |= RCC_APB2ENR_ADC1EN; // Enable ADC1 clock
+    /***** Enable necessary clocks *****/
+    // Enable AHB1 peripherals (GPIO ports)
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN    // GPIOA for UART, ADC
+                 |  RCC_AHB1ENR_GPIOCEN     // GPIOC for BTN, PWM
+                 |  RCC_AHB1ENR_GPIOBEN;    // GPIOB for SSD segments
+
+    // Enable APB1 peripherals (USART2, TIM2, TIM3)
+    RCC->APB1ENR |= RCC_APB1ENR_USART2EN   // UART2
+                 |  RCC_APB1ENR_TIM2EN      // SSD multiplexing timer
+                 |  RCC_APB1ENR_TIM3EN;     // Input capture timer
+
+    // Enable APB2 peripherals (ADC, TIM8, SYSCFG)
+    RCC->APB2ENR |= RCC_APB2ENR_ADC1EN     // ADC1 for potentiometer
+                 |  RCC_APB2ENR_TIM8EN      // Advanced timer for servo PWM
+                 |  RCC_APB2ENR_SYSCFGEN;   // For EXTI button interrupt
 
     /***** Initializations *****/
     TIM2_Config();
-    SysTick_Config(16000000 * 0.5 - 1);  
+    SysTick_Config(16000000 * 1 - 1);  
     NVIC_SetPriority(SysTick_IRQn, 3); 
 
     PWM_Output_PC6_Init();
     BTN_Config();
     uart_Config();
+    SSD_init();
+    Pot_Config();
+
+    ADC1->CR2 |= ADC_CR2_SWSTART;
 
     /***** Loop *****/
     while(1);
+
+    return 0;
 }
