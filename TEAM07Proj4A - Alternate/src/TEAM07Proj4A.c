@@ -29,44 +29,31 @@
 #define SERVO3_FEED_PIN 7
 
 #define POT_PORT    GPIOA
-#define WIPER_PIN   1
+#define POT_PIN     1
 
 #define ADC_CHANNEL 1
 
 /***** Variables *****/
 
-volatile bool going_cw = true;
-volatile bool stopped = false;
-
-volatile uint32_t signal_pulse_width;
 volatile uint32_t pot_val;
-volatile float rpm = 0.0;
-volatile int digit_select = 0;
+volatile uint32_t signal_pulse;
 
-volatile bool waiting_for_falling = false;
+volatile bool stopped = true;
+volatile bool going_cw = true;
 
 volatile uint32_t rise;
-volatile uint32_t fall;
-volatile uint32_t pulse_width;
+volatile uint32_t feedback_pulse;
 
-volatile uint32_t current_angle;
-volatile uint32_t last_angle;
+volatile int angular_position = 0;
+int min_pulse = 32;
+int max_pulse = 1076;
 
-volatile uint32_t current_time;
-volatile uint32_t last_time;
+volatile uint32_t last_measurement_time;
+volatile uint32_t last_angular_position;
 
-volatile float time_diff;
-volatile float angle_diff;
-uint32_t min_pulse_width = 32;
-uint32_t max_pulse_width = 1076;
+volatile float angular_speed = 0.0;
 
-volatile int systick_tick = 0;
-
-
-
-void uart_sendString(const char* str);
-void uart_send_int32(int32_t val);
-void uart_send_float(float val);
+volatile uint32_t digit_select = 0;
 
 /***** Helper Functions *****/
 
@@ -82,19 +69,6 @@ void TIM2_Config(void) {
     NVIC_EnableIRQ(TIM2_IRQn); // Enable TIM2 interrupt in NVIC
     NVIC_SetPriority(TIM2_IRQn, 2); // Set priority for TIM2
     TIM2->CR1 = TIM_CR1_CEN; // Enable TIM2
-}
-
-void TIM3_Config(void) {
-	// Configure TIM3 for simple input capture on CH2 (PC7)
-	TIM3->PSC = 15; // 16 MHz / 16 = 1 MHz timer clock (1us resolution)
-	TIM3->ARR = 0xFFFF;
-	TIM3->CCMR1 &= ~(0x3 << 8); // CC2S bits for CH2
-	TIM3->CCMR1 |= (0x01 << 8); // CC2: IC2 mapped to TI2
-	TIM3->CCER &= ~(TIM_CCER_CC2P | TIM_CCER_CC2NP); // Rising edge
-	TIM3->CCER |= TIM_CCER_CC2E; // Enable capture on CH2
-	TIM3->DIER |= TIM_DIER_CC2IE; // Enable capture/compare 2 interrupt
-	TIM3->CR1 |= TIM_CR1_CEN;
-	NVIC_EnableIRQ(TIM3_IRQn); // Enable TIM3 interrupt in NVIC
 }
 
 /// @brief This function configures TIM5 as a free-running clock w/ 1us period
@@ -141,45 +115,30 @@ void PWM_Output_PC6_Init(void) {
 }
 
 void PWM_Input_PC7_Init(void) {
-	// Set PC7 to alternate function (AF2 for TIM3_CH2)
-	GPIOC->MODER &= ~(0x3 << (7 * 2));
-	GPIOC->MODER |=  (0x2 << (7 * 2)); // Alternate function
-	GPIOC->AFR[0] &= ~(0xF << (7 * 4));
-	GPIOC->AFR[0] |=  (0x2 << (7 * 4)); // AF2 = TIM3
+    // Configure PC7 as input
+    SERVO3_PORT->MODER &= ~(0x3 << (SERVO3_PIN * 2));
+
+    // Configure EXTI
+    SYSCFG->EXTICR[0] &= ~(0xF << (SERVO3_FEED_PIN * 4));
+    SYSCFG->EXTICR[0] |= (0x2 << (SERVO3_FEED_PIN * 4));
+    EXTI->IMR |= (1 << SERVO3_FEED_PIN);
+    EXTI->RTSR |= (1 << SERVO3_FEED_PIN);
+    EXTI->FTSR |= (1 << SERVO3_FEED_PIN);
+
+    // Configure NVIC
+    NVIC_SetPriority(EXTI9_5_IRQn, 1);
+    NVIC_EnableIRQ(EXTI9_5_IRQn);
 }
 
-/// @brief sends pulse to servo with pulsewidth corresponding to the desired angle
-/// @param angle angle to send the standard servo to  
-void servo_angle_set(int speed) {
+/// @brief sends pulse to servo with pulsewidth corresponding to the desired speed
+void servo_speed_set() {
     // Assuming speeds from 0 to 4095 (12-bit ADC range)
-    uint32_t delta = ( (uint32_t)speed * 200u ) / 4095u;
-    if (stopped) signal_pulse_width = 1500u;
-    else if (going_cw) signal_pulse_width = 1480u - delta;
-    else signal_pulse_width = delta + 1510u;
+    uint32_t speed = ( pot_val * 200u ) / 4095u;
+    if (stopped) signal_pulse = 1500u;
+    else if (going_cw) signal_pulse = 1480u - speed;
+    else signal_pulse = speed + 1520u;
     // Write to TIM8 CH1 CCR (PC6 PWM output)
-    TIM8->CCR1 = signal_pulse_width;
-}
-
-void calculate_rpm(void) {
-    if (current_time >= last_time) time_diff = (float)(current_time - last_time);
-    else time_diff = (float)((0xFFFFFFFF - last_time) + current_time + 1);
-
-    if (going_cw) {
-        if (current_angle >= last_angle) angle_diff = (float)(current_angle - last_angle);
-        else angle_diff = (float)((360.0f - last_angle) + current_angle);
-    }
-    else {
-        if (last_angle > current_angle) angle_diff = (float)(last_angle - current_angle);
-        else angle_diff = (float)((360.0f - current_angle) + last_angle);
-    }
-
-    if (time_diff == 0.0f) { 
-        rpm = 0.0f;
-        return;
-    }
-
-    rpm = (angle_diff / 360.0f) / (time_diff / 60000000.0f);
-    if (rpm > 180.0f) rpm = 0.0f;
+    TIM8->CCR1 = signal_pulse;
 }
 
 /***** UART Functions *****/
@@ -240,10 +199,11 @@ void uart_display() {
     else uart_sendString("CCW");
 
     uart_sendString("\t\tservo (us): ");
-    uart_send_int32(signal_pulse_width);
+    uart_send_int32(signal_pulse);
 
     uart_sendString("\t\trpm: ");
-    uart_send_float(rpm);
+    uart_send_float(angular_speed);
+
     uart_sendString("\r\n");
 }
 
@@ -270,20 +230,20 @@ void BTN_Config(void) {
 void Pot_Config(void) {
     // Set PA1 (ADC) to analog mode
     RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
-    POT_PORT->MODER &= ~(0x3 << (WIPER_PIN * 2));
-    POT_PORT->MODER |= (0x3 << (WIPER_PIN * 2));
+    POT_PORT->MODER &= ~(0x3 << (POT_PIN * 2));
+    POT_PORT->MODER |= (0x3 << (POT_PIN * 2));
     // Initialize ADC, Default resolution is 12 bits
     ADC1->SQR3 = ADC_CHANNEL; // Select channel
     ADC1->SMPR2 = ADC_SMPR2_SMP1_0 | ADC_SMPR2_SMP1_1; // Sample time 56 cycles
     ADC1->CR1 |= ADC_CR1_EOCIE; // Enable End of Conversion interrupt
-    ADC1->CR2 = ADC_CR2_ADON; // Enable ADC
+    ADC1->CR2 = ADC_CR2_ADON | ADC_CR2_CONT; // Enable ADC
     
     // Configure NVIC for ADC interrupt
     NVIC_EnableIRQ(ADC_IRQn);
     NVIC_SetPriority(ADC_IRQn, 1);
+
+    ADC1->CR2 |= ADC_CR2_SWSTART;
 }
-
-
 
 /***** Interrupts *****/
 
@@ -303,67 +263,68 @@ void EXTI15_10_IRQHandler(void) {
     }
 }
 
-/// @brief Handles updating SSD with most recent rpm measurement.
+/// @brief Handles updating SSD with most recent distance measurement.
 /// Triggered by TIM2 interrupt every 500 us (0.5 ms).
 void TIM2_IRQHandler(void){
     if (TIM2->SR & TIM_SR_UIF) {
         TIM2->SR &= ~TIM_SR_UIF; // clear update interrupt flag
         digit_select = (digit_select + 1) % 4;
+        
+        SSD_update(digit_select, (int)(angular_speed * 10), 3);
 
-        SSD_update(digit_select, (int)(rpm * 10), 3);
+        // Set speed here so it isn't updated too frequently
+        servo_speed_set();
     }
 }
 
-/// @brief TIM3 input capture interrupt handler for PC7 (CH2)
-void TIM3_IRQHandler(void) {
-	if (TIM3->SR & TIM_SR_CC2IF) { // Check if CC2IF is set
-		TIM3->SR &= ~TIM_SR_CC2IF; // Clear interrupt flag
-        if (!waiting_for_falling) {
-            rise = TIM3->CCR2;
-            // Switch to capture falling edge
-            TIM3->CCER |= TIM_CCER_CC2P; // Set to falling edge
-            waiting_for_falling = 1;
-        } 
-        else {
-            fall = TIM3->CCR2;
-			if (fall >= rise) {
-				if (fall - rise < 1100) pulse_width = fall - rise;
-			} 
-            else pulse_width = (0xFFFF - rise) + fall + 1;
+/// @brief If rising edge, capture current time
+//         If falling edge, calculate PW and convert to angular position and store last_measurement_time
+//              If a previous angular position exists, calculate angle_delta and time_delta
+//              where rpm = angle_delta in rotations / time_delta in minutes
+//              (time_delta = TIM5->CNT - last_measurement_time)
+//              (angle_delta = angular_position - last_angular_position)
+void EXTI9_5_IRQHandler(void) {
+    if (EXTI->PR & (1 << SERVO3_FEED_PIN)) {
+        EXTI->PR |= (1 << SERVO3_FEED_PIN);
 
-            current_angle = ((pulse_width - min_pulse_width)*360)/(max_pulse_width - min_pulse_width);
-
-            current_time = TIM5->CNT;
-
-            TIM3->CCER &= ~TIM_CCER_CC2P; // Set to rising edge
-            waiting_for_falling = 0;
+        if (SERVO3_PORT->IDR & (1 << SERVO3_FEED_PIN)) {
+            // Rising Edge
+            rise = TIM5->CNT;
         }
-	}
+        else {
+            // Falling Edge
+            if (TIM5->CNT >= rise) feedback_pulse = TIM5->CNT - rise;
+            else feedback_pulse = (0xFFFFFFFF - rise) + TIM5->CNT + 1;
+
+            // Calculate angular position based on feedback_pulse
+            angular_position = (feedback_pulse - min_pulse)*360/(max_pulse - min_pulse);
+
+            // Attempt rotational_speed calculation
+            if (last_angular_position && last_measurement_time) {
+                // Account for rollover and direction
+                int angle_delta = last_angular_position - angular_position;
+                int time_delta = TIM5->CNT - last_measurement_time;
+
+                angular_speed = ((float)angle_delta/360.0f) / ((float)time_delta/60e6f);
+            }
+
+            last_measurement_time = TIM5->CNT;
+            last_angular_position = angular_position;
+        }
+
+    } 
 }
+
 
 /// @brief Display to uart every 1 second
 void SysTick_Handler(void) {
-    if (systick_tick == 9) {
-        uart_display();
-        systick_tick = (systick_tick + 1) % 10;
-    }
-
-    if (last_time && last_angle && !stopped) calculate_rpm();
-    else rpm = 0.0f;
-    last_time = current_time;
-    last_angle = current_angle;
-
-    systick_tick = (systick_tick + 1) % 10;
+    uart_display();
 }
 
 /// @brief Handles ADC conversion complete interrupt
 void ADC_IRQHandler(void) {
     if (ADC1->SR & ADC_SR_EOC) {  // Check if End of Conversion
         pot_val = ADC1->DR;      // Read the converted value
-
-        servo_angle_set(pot_val);
-        // Start next conversion
-        ADC1->CR2 |= ADC_CR2_SWSTART;
     }
 }
  
@@ -388,10 +349,9 @@ int main(void) {
                  |  RCC_APB2ENR_SYSCFGEN;   // For EXTI button interrupt
 
     /***** Initializations *****/
-    SysTick_Config(16000000 * 0.1 - 1);  
+    SysTick_Config(FREQUENCY * 1 - 1);  
     NVIC_SetPriority(SysTick_IRQn, 3); 
     TIM2_Config();
-    TIM3_Config();
     TIM5_Config();
     TIM8_Config();
 
@@ -401,8 +361,6 @@ int main(void) {
     uart_Config();
     SSD_init();
     Pot_Config();
-
-    ADC1->CR2 |= ADC_CR2_SWSTART;
 
     /***** Loop *****/
     while(1);
