@@ -34,9 +34,20 @@ volatile uint32_t IR_reading;
 volatile int digit_select = 0;
 
 /***** Movement State *****/
-volatile bool left_stopped = false;
-volatile bool right_stopped = false;
-volatile bool hit_first = false; 
+typedef enum state {
+    stop,
+    left,
+    right,
+    forward
+} state_e;
+volatile state_e movement = stop;
+
+typedef enum stop_state {
+    before,
+    on,
+    after
+} stop_state_e;
+volatile stop_state_e stop_state = before;
 
 /************************* Function Declarations *************************/
 
@@ -76,8 +87,8 @@ int main(void) {
     SSD_init();
     IR_Sensor_Init();
 
+    movement = stop;
     /***** Wait for Interrupt *****/
-    //__WFI(); // Low power wait defined by CMSIS
     while (1);
 
     return 0;
@@ -158,27 +169,45 @@ void PWM_Output_PC9_Init(void) {
 }
 
 /// @brief sends pulses to servos with pulsewidths corresponding to current reading
-void servo_speed_update() {
-    uint32_t left_pw; 
-    uint32_t right_pw;
+void servo_speed_update(void) {
+    volatile uint32_t left_pw; 
+    volatile uint32_t right_pw;
 
-    if (left_stopped) left_pw = 1500;
-    else left_pw = 1280;
+    switch (movement) {
+        case stop: 
+            left_pw = 1500; right_pw = 1500;
+            break;
+        case left:
+            // left_pw = 1600; right_pw = 1450;
+            // left_pw = 1560; right_pw = 1580;
+            // left_pw = 1580; right_pw = 1500;
+            left_pw = 1580; right_pw = 1500;
+            break;
+        case right:
+            // left_pw = 1550; right_pw = 1400;
+            // left_pw = 1440; right_pw = 1420;
+            // left_pw = 1450; right_pw = 1300;
+            left_pw = 1500; right_pw = 1400;
+            break;
+        case forward:
+            left_pw = 1580; right_pw = 1400;
+            break;
+    }
 
-    if (right_stopped) right_pw = 1500;
-    else right_pw = 1720;
-
-    TIM8->CCR1 = right_pw;
-    TIM8->CCR4 = left_pw;
+    TIM8->CCR4 = right_pw;
+    TIM8->CCR1 = left_pw;
 }
 
+/// @brief Creates an integer version of current IR reading that can be displayed
+/// via SSD_update().
+/// @return Integer version of IR reading (ie. 110 for centered on line)
 int get_display_reading(void) {
     int display_reading = 0;
 
-    if (IR_reading & 0b1000) display_reading += 1000;
-    if (IR_reading & 0b0100) display_reading += 100;
-    if (IR_reading & 0b0010) display_reading += 10;
-    if (IR_reading & 0b0001) display_reading += 1;
+    if (IR_reading & 0b1000) display_reading += 1000;   // 1st Digit
+    if (IR_reading & 0b0100) display_reading += 100;    // 2nd Digit
+    if (IR_reading & 0b0010) display_reading += 10;     // 3rd Digit
+    if (IR_reading & 0b0001) display_reading += 1;      // 4th Digit
 
     return display_reading;
 }
@@ -213,62 +242,78 @@ void IR_Sensor_Init(void) {
 
 /***** Interrupts *****/
 
-/// @brief Handles button presses to cycle through directions: CW, CCW 
+/// @brief Handles button presses to cycle movement, stopped or forward
 /// stopping between transitions. Triggered by interrupt on [15:10] line
 void EXTI15_10_IRQHandler(void) {
     if (EXTI->PR & (1 << BTN_PIN)) { // Check if the interrupt is from BTN_PIN
         EXTI->PR |= (1 << BTN_PIN); // Clear the pending interrupt
+        
+        stop_state = before;
 
-        if (left_stopped && right_stopped) {
-            left_stopped = false;
-            right_stopped = false;
-        }
+        if (movement == stop) movement = forward;
         else {
-            left_stopped = true;
-            right_stopped = true;
+            movement = stop;
         }
     }
 }
 
-/// @brief Handles getting IR reading and interpreting it; updates SSD with IR_reading
-/// Triggered by TIM2 interrupt every 500 us (0.5 ms).
+/// @brief Handles getting IR reading and interpreting it, updating current reading.
+/// Updates SSD with IR_reading. Triggered by TIM2 interrupt every 500 us (0.5 ms).
 void TIM2_IRQHandler(void){
     if (TIM2->SR & TIM_SR_UIF) {
         // Read IR and invert so a 1 represents line hit
         IR_reading = (~IR_SENSOR_PORT->IDR) & 0b1111; 
 
-        // STOP Condition
-        if (IR_reading == 0b1111) { 
-            if (hit_first){
-                left_stopped = true;
-                right_stopped = true;
-            }
-            else hit_first = true;
+        
+        if (movement == stop) {
+            TIM8->CCR4 = 1500;
+            TIM8->CCR1 = 1500;
+
+            /***** Update SSD *****/
+            digit_select = (digit_select + 1) % 4;
+            SSD_update(digit_select, get_display_reading(), 0);
+            TIM2->SR &= ~TIM_SR_UIF; // clear update interrupt flag
+            return;
         }
-        // RIGHT Condition
+        
+
+        // STOP Condition - check state transitions
+        if (stop_state == before && IR_reading == 0b1111) {
+            stop_state = on;
+            movement = forward;
+        }
+        else if (stop_state == on && IR_reading != 0b1111) {
+            stop_state = after;
+            movement = forward;
+        }
+        else if (stop_state == after && IR_reading == 0b1111) {
+            stop_state = before;  // Reset for next cycle
+            movement = stop;
+        }
+        // FORWARD Condition
+        else if (IR_reading == 0b0110) {
+            movement = forward;
+        }
+        // RIGHT Condition (Break into soft/hard turn?)
         else if ( 
             (IR_reading == 0b0001)
             | (IR_reading == 0b0010)
             | (IR_reading == 0b0011)
             | (IR_reading == 0b0111)
         ) {
-            left_stopped = false;
-            right_stopped = true;
+            movement = left;
         }
-        // LEFT Condition
+        // LEFT Condition (Break into soft/hard turn?)
         else if (
             (IR_reading == 0b0100)
             | (IR_reading == 0b1000)
             | (IR_reading == 0b1100)
             | (IR_reading == 0b1110)
         ) {
-            left_stopped = true;
-            right_stopped = false;
+            movement = right;
         }
-        // ERROR Condition (Unlikely Reading)
-        else { 
-            left_stopped = true;
-            right_stopped = true;
+        else if (IR_reading == 0b0000) {
+            movement = stop;
         }
 
         servo_speed_update();
