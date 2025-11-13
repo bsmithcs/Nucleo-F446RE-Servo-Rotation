@@ -84,6 +84,7 @@ void TIM2_Config(void) {
     TIM2->CR1 = TIM_CR1_CEN; // Enable TIM2
 }
 
+/// @brief Used for PWM Input from signal wire (Capture/Compare)
 void TIM3_Config(void) {
 	// Configure TIM3 for simple input capture on CH2 (PC7)
 	TIM3->PSC = 15; // 16 MHz / 16 = 1 MHz timer clock (1us resolution)
@@ -98,7 +99,7 @@ void TIM3_Config(void) {
 }
 
 /// @brief This function configures TIM5 as a free-running clock w/ 1us period
-/// (1 MHz). Used to count pulse length. 
+/// (1 MHz). Used to count . 
 void TIM5_Config(void) {
     RCC->APB1ENR |= RCC_APB1ENR_TIM5EN; // Enable TIM5 clock
     TIM5->PSC = 15; // Prescaler: (16MHz/16 = 1MHz, 1usec period)
@@ -106,6 +107,7 @@ void TIM5_Config(void) {
     TIM5->EGR = TIM_EGR_UG; // Update event generation register
     TIM5->CR1 = TIM_CR1_CEN; // Enable TIM5
 }
+
 
 void TIM8_Config(void) {
 	// Configure TIM8 for PWM output on CH1 (PC6)
